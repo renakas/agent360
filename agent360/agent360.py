@@ -42,6 +42,8 @@ import threading
 import time
 import types
 from optparse import OptionParser
+from logging import Formatter, getLogger, StreamHandler
+from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 
 try:
     from urllib.parse import urlparse, urlencode
@@ -367,35 +369,98 @@ class Agent:
             self.config.add_section(section)
 
     def _logging_init(self):
-        '''
-        Initialize logging faculty
-        '''
+        """
+        Initialize logging with optional in-app log rotation.
+        Supported rotation modes:
+          - none (default): plain FileHandler (use with external logrotate)
+          - size: RotatingFileHandler
+          - time: TimedRotatingFileHandler
+        """
         level = self.config.getint('agent', 'logging_level')
 
+        # Resolve target log file path
         if os.name == 'nt':
             log_file = os.path.expandvars(self.config.get('agent', 'log_file'))
         else:
             log_file = self.config.get('agent', 'log_file')
 
+        # Normalize legacy 'log_file_mode' (kept for compatibility)
         log_file_mode = self.config.get('agent', 'log_file_mode')
-        if log_file_mode in ('w', 'a'):
-            pass
-        elif log_file_mode == 'truncate':
-            log_file_mode = 'w'
-        elif log_file_mode == 'append':
-            log_file_mode = 'a'
-        else:
-            log_file_mode = 'a'
+        if log_file_mode not in ('w', 'a'):
+            if log_file_mode == 'truncate':
+                log_file_mode = 'w'
+            else:
+                log_file_mode = 'a'
 
-        if log_file == '-':
-            logging.basicConfig(level=level)  # Log to sys.stderr by default
-        else:
-            try:
-                logging.basicConfig(filename=log_file, filemode=log_file_mode, level=level, format="%(asctime)-15s  %(levelname)s    %(message)s")
-            except IOError as e:
-                logging.basicConfig(level=level)
-                logging.info('IOError: %s', e)
-                logging.info('Drop logging to stderr')
+        # Rotation config (all optional)
+        rotation = self.config.get('agent', 'rotation') if self.config.has_option('agent', 'rotation') else 'none'
+        rotation_compress = self.config.getboolean('agent', 'rotation_compress') if self.config.has_option('agent', 'rotation_compress') else False
+        # Size-based defaults (10MB, keep 7 files)
+        rotation_max_bytes = self.config.getint('agent', 'rotation_max_bytes') if self.config.has_option('agent', 'rotation_max_bytes') else 10 * 1024 * 1024
+        rotation_backup_count = self.config.getint('agent', 'rotation_backup_count') if self.config.has_option('agent', 'rotation_backup_count') else 7
+        # Time-based defaults (roll at midnight, keep 7 files)
+        rotation_when = self.config.get('agent', 'rotation_when') if self.config.has_option('agent', 'rotation_when') else 'midnight'
+        rotation_interval = self.config.getint('agent', 'rotation_interval') if self.config.has_option('agent', 'rotation_interval') else 1
+        rotation_utc = self.config.getboolean('agent', 'rotation_utc') if self.config.has_option('agent', 'rotation_utc') else False
+
+        # Configure root logger explicitly (avoid basicConfig)
+        root = getLogger()
+        root.setLevel(level)
+        fmt = Formatter("%(asctime)-15s %(levelname)s %(message)s")
+
+        try:
+            if log_file == '-':
+                # Container/journald-friendly: write to stderr
+                handler = StreamHandler()
+            else:
+                if rotation == 'none':
+                    # No rotation at all
+                    handler = logging.FileHandler(log_file, mode=log_file_mode)
+                elif rotation == 'time':
+                    # Time-based rotation
+                    handler = TimedRotatingFileHandler(
+                        log_file,
+                        when=rotation_when,       # e.g., 'S', 'M', 'H', 'D', 'midnight', 'W0'
+                        interval=rotation_interval,
+                        backupCount=rotation_backup_count,
+                        utc=rotation_utc
+                    )
+                else:
+                    # Size-based rotation
+                    handler = RotatingFileHandler(
+                        log_file,
+                        mode=log_file_mode,
+                        maxBytes=rotation_max_bytes,
+                        backupCount=rotation_backup_count
+                    )
+
+                # Add gzip compression if enabled
+                if rotation != 'none' and rotation_compress:
+                    import gzip
+                    import shutil
+                    
+                    def namer(name):
+                        """Add .gz suffix to rotated files"""
+                        return name + ".gz"
+                    
+                    def rotator(source, dest):
+                        """Compress rotated log files with gzip"""
+                        with open(source, 'rb') as f_in:
+                            with gzip.open(dest, 'wb') as f_out:
+                                shutil.copyfileobj(f_in, f_out)
+                        os.remove(source)
+                    
+                    handler.namer = namer
+                    handler.rotator = rotator
+
+            handler.setFormatter(fmt)
+            root.handlers = [handler]
+        except IOError as e:
+            # Fall back to stderr if file cannot be opened
+            root.handlers = [StreamHandler()]
+            root.handlers[0].setFormatter(fmt)
+            logging.info('IOError: %s', e)
+            logging.info('Drop logging to stderr')
 
         logging.info('Agent logging_level %i', level)
 
